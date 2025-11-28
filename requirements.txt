@@ -1,0 +1,10 @@
+pandas
+numpy
+scipy
+matplotlib
+pyarrow
+fastparquet
+hmmlearn
+scikit-learn
+streamlit
+joblib
