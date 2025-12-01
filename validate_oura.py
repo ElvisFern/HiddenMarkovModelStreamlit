@@ -6,6 +6,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 from joblib import load
+from scipy.stats import spearmanr
+
 
 MODEL_DIR = Path("models")
 FIG_DIR = Path("reports/figures")
@@ -313,19 +315,73 @@ def apply_model(df):
     with open(MODEL_DIR / "labels.json") as f:
         label_map = {int(k): v for k, v in json.load(f).items()}
 
-    # Ensure the required feature columns exist (fill with NaN if missing; imputer will handle)
+    # -------- GUARDS: fix bad startprob_/transmat_ from old models --------
+    K = getattr(hmm, "n_components", None) or len(set(label_map))
+    def _sticky_T(K, stay=0.95):
+        T = np.full((K, K), (1.0 - stay) / (K - 1))
+        np.fill_diagonal(T, stay)
+        return T
+
+    # startprob_
+    needs_start = (
+        not hasattr(hmm, "startprob_")
+        or not np.isfinite(hmm.startprob_).all()
+        or hmm.startprob_.ndim != 1
+        or hmm.startprob_.shape[0] != K
+        or not np.isclose(hmm.startprob_.sum(), 1.0)
+    )
+    if needs_start:
+        start = np.zeros(K, dtype=float)
+        start[0] = 1.0
+        hmm.startprob_ = start
+
+    # transmat_
+    needs_T = (
+        not hasattr(hmm, "transmat_")
+        or not np.isfinite(hmm.transmat_).all()
+        or hmm.transmat_.shape != (K, K)
+        or np.any(hmm.transmat_.sum(axis=1) == 0.0)
+        or not np.allclose(hmm.transmat_.sum(axis=1), 1.0)
+    )
+    if needs_T:
+        # if you trained binary, this becomes [[.96,.04],[.10,.90]]; otherwise sticky-K
+        hmm.transmat_ = _sticky_T(K, stay=0.95)
+    # ----------------------------------------------------------------------
+
+    # Ensure feature columns exist; imputer will handle NaNs
     for c in used_feats:
         if c not in df.columns:
             df[c] = np.nan
 
     X_raw = df[used_feats].astype(float).values
     X = imputer.transform(X_raw)
+
+    # Predictions
     states = hmm.predict(X)
     post = hmm.predict_proba(X)
+
+    # Map ids -> names
     df["state_id"] = states
-    df["state"] = [label_map[s] for s in states]
-    df["post_max"] = post.max(axis=1)
+    df["state"] = [label_map.get(s, str(s)) for s in states]
+
+    # Choose the “not healthy” state index
+    target_names = {"not_healthy", "symptomatic", "prodrome"}
+    not_idx = next((sid for sid, name in label_map.items() if name in target_names), None)
+    if not_idx is None:
+        # Fallback: higher severity (+rhr +temp −rmssd). Align weights to used_feats.
+        # Order expected: rhr_z, rmssd_z, temp_z, seff_z (if present).
+        weight_map = {"rhr_z": +1.0, "rmssd_z": -1.0, "temp_z": +1.0, "seff_z": -1.0}
+        w = np.array([weight_map.get(f, 0.0) for f in used_feats], dtype=float)
+        sev = hmm.means_.dot(w)
+        not_idx = int(np.argmax(sev))
+
+    # Soft probability and thresholding
+    p_not = post[:, not_idx]
+    df["p_not_healthy"] = p_not
+    df["state_soft"] = np.where(p_not >= 0.40, "not_healthy", "healthy")  # tune 0.35–0.55
+
     return df, post, label_map, used_feats
+
 
 def plot_timeline(df, outpath):
     plt.figure(figsize=(11,4))
@@ -344,38 +400,109 @@ def plot_timeline(df, outpath):
     plt.savefig(outpath, dpi=150)
     plt.close()
 
-def quick_report(df):
+
+def summarize_emissions(hmm, used_feats, label_map):
+    K = hmm.n_components
+    means = np.asarray(hmm.means_)
+    covars = getattr(hmm, "covars_", None) or getattr(hmm, "_covars_", None)
+    if covars is None:
+        covars = np.ones_like(means)
+    if covars.ndim == 1:
+        covars = np.tile(covars[None, :], (K, 1))
+    rows = []
+    for k in range(K):
+        name = label_map.get(k, str(k))
+        for j, feat in enumerate(used_feats):
+            rows.append({
+                "state_id": k, "state": name, "feature": feat,
+                "mean": float(means[k, j]), "var": float(covars[k, j]),
+                "std": float(np.sqrt(covars[k, j]))
+            })
+    return pd.DataFrame(rows)
+
+def threshold_summary(df, p_col="p_not_healthy", proxy_col="readiness", thr=0.40):
+    out = {}
+    if proxy_col not in df.columns or not df[proxy_col].notna().any():
+        out["available"] = False
+        return out
+    q20 = float(df[proxy_col].quantile(0.20))
+    y_true = (df[proxy_col] <= q20).astype(int)           # 1 = bad readiness
+    y_pred = (df[p_col] >= thr).astype(int)               # 1 = model flags not_healthy
+    TP = int(((y_true == 1) & (y_pred == 1)).sum())
+    FP = int(((y_true == 0) & (y_pred == 1)).sum())
+    TN = int(((y_true == 0) & (y_pred == 0)).sum())
+    FN = int(((y_true == 1) & (y_pred == 0)).sum())
+    P, N = TP + FN, TN + FP
+    sens = TP / P if P else np.nan
+    spec = TN / N if N else np.nan
+    prec = TP / (TP + FP) if (TP + FP) else np.nan
+    bacc = (sens + spec) / 2 if np.isfinite(sens) and np.isfinite(spec) else np.nan
+    out.update({
+        "available": True, "threshold": thr, "q20_readiness": q20,
+        "TP": TP, "FP": FP, "TN": TN, "FN": FN,
+        "sensitivity": sens, "specificity": spec,
+        "precision": prec, "balanced_accuracy": bacc,
+        "prevalence_q20": P / (P + N) if (P + N) else np.nan,
+    })
+    return out
+
+def quick_report(df, hmm=None, used_feats=None, label_map=None, p_col="p_not_healthy", thr=0.40):
+    """
+    Counts & dwells, overlap@Q20, Spearman rho(p_not, readiness),
+    confusion @ threshold, emission means/vars preview (if model provided).
+    """
     if df.empty:
         return {"msg": "No data after preprocessing."}
 
-    have_readiness = ("readiness" in df.columns) and df["readiness"].notna().any()
-    ill_mask = df["state"].isin(["prodrome","symptomatic"])
-    ill_n = int(ill_mask.sum())
+    out = {}
+    # --- basic counts + dwells ---
+    seq = df["state"].tolist() if "state" in df.columns else []
+    if seq:
+        dwells, cur, n = [], seq[0], 1
+        for s in seq[1:]:
+            if s == cur: n += 1
+            else: dwells.append((cur, n)); cur, n = s, 1
+        dwells.append((cur, n))
+        out["dwells_head"] = dwells[:10]
+        out["nights"] = len(seq)
+        out["state_counts"] = dict(pd.Series(seq).value_counts())
 
-    # dwell summary
-    seq = df["state"].tolist()
-    dwells, cur, n = [], seq[0], 1
-    for s in seq[1:]:
-        if s == cur: n += 1
-        else: dwells.append((cur, n)); cur, n = s, 1
-    dwells.append((cur, n))
+    # --- which labels count as "ill" (binary-safe) ---
+    if label_map is not None:
+        ill_labels = {name for name in label_map.values() if name != "healthy"}
+    else:
+        ill_labels = {"not_healthy"}
 
-    out = {"ill_nights": ill_n, "dwells": dwells[:10]}
+    if "state" in df.columns:
+        out["ill_nights"] = int(df["state"].isin(ill_labels).sum())
 
-    if not have_readiness:
-        out["msg"] = "Readiness not present."
-        return out
+    # --- readiness-based signals ---
+    if "readiness" in df.columns and df["readiness"].notna().any():
+        q20 = float(df["readiness"].quantile(0.20))
+        out["readiness_q20"] = q20
 
-    if ill_n == 0:
-        out["msg"] = "No illness states detected; overlap not computed."
-        # still return quantiles for context
-        out["readiness_q20"] = float(df["readiness"].quantile(0.2))
-        return out
+        if "state" in df.columns:
+            ill_mask = df["state"].isin(ill_labels)
+            if ill_mask.any():
+                overlap = (df.loc[ill_mask, "readiness"] <= q20).mean()
+                out["overlap_q20_ill_states"] = float(overlap)
 
-    q20 = df["readiness"].quantile(0.2)
-    overlap = (df.loc[ill_mask, "readiness"] <= q20).mean()
-    out["overlap_q20"] = float(overlap)
-    out["readiness_q20"] = float(q20)
+        if p_col in df.columns and df[p_col].notna().any():
+            rho, pval = spearmanr(df[p_col], df["readiness"], nan_policy="omit")
+            out["spearman_rho_p_not_vs_readiness"] = float(rho)
+            out["spearman_pval"] = float(pval)
+            out["threshold_summary"] = threshold_summary(df, p_col=p_col, thr=thr)
+    else:
+        out["readiness_note"] = "Readiness not present—overlap/correlation unavailable."
+
+    # --- emission interpretability ---
+    if hmm is not None and used_feats is not None and label_map is not None:
+        try:
+            emis_tbl = summarize_emissions(hmm, used_feats, label_map)
+            out["emissions_preview"] = emis_tbl.head(8).to_dict(orient="records")
+        except Exception as e:
+            out["emissions_error"] = f"{type(e).__name__}: {e}"
+
     out["msg"] = "OK"
     return out
 
@@ -386,24 +513,47 @@ if __name__ == "__main__":
 
     out_img = Path("reports/figures/oura_timeline.png")
     plot_timeline(df, out_img)
-
-    stats = quick_report(df)  # uses the revised function
     print(f"[OK] Timeline -> {out_img}")
 
-    if stats.get("msg") == "OK":
-        print(f"Illness nights: {stats['ill_nights']}, "
-              f"overlap with lowest 20% readiness: {stats['overlap_q20']:.1%}")
-        print(f"Readiness 20th percentile: {stats['readiness_q20']:.1f}")
-    elif stats.get("msg") == "No illness states detected; overlap not computed.":
-        print(stats["msg"])
-        if "readiness_q20" in stats:
-            print(f"Readiness 20th percentile: {stats['readiness_q20']:.1f}")
-    else:
-        # e.g., "Readiness not present." or "No data after preprocessing."
-        print(stats.get("msg", "Done."))
+    # load model for emission summary
+    hmm = load(MODEL_DIR / "model.pkl")
 
-    print(f"Example dwells (state,nights): {stats.get('dwells', [])}")
+    stats = quick_report(
+        df, hmm=hmm, used_feats=used_feats, label_map=label_map,
+        p_col="p_not_healthy", thr=0.40
+    )
+
+    print("[REPORT] nights:", stats.get("nights"))
+    print("[REPORT] ill_nights:", stats.get("ill_nights"))
+    print("[REPORT] state_counts:", stats.get("state_counts"))
+
+    rq = stats.get("readiness_q20")
+    if rq is not None:
+        print(f"[REPORT] readiness_q20: {rq:.1f}")
+
+    ov = stats.get("overlap_q20_ill_states")
+    if ov is not None:
+        print(f"[REPORT] overlap@Q20 (ill states): {ov:.1%}")
+
+    rho, pv = stats.get("spearman_rho_p_not_vs_readiness"), stats.get("spearman_pval")
+    if rho is not None and pv is not None:
+        print(f"[REPORT] Spearman rho(p_not, readiness): {rho:.3f} (p={pv:.3g})")
+
+    ts = stats.get("threshold_summary", {})
+    if ts.get("available"):
+        print(f"[REPORT] thr={ts['threshold']:.2f} | TP={ts['TP']} FP={ts['FP']} TN={ts['TN']} FN={ts['FN']}")
+        print(f"[REPORT] sens={ts['sensitivity']:.2f} spec={ts['specificity']:.2f} "
+              f"prec={ts['precision']:.2f} bacc={ts['balanced_accuracy']:.2f} "
+              f"prev={ts['prevalence_q20']:.2f}")
+
+    # optional: save full emissions table
+    try:
+        emis_df = summarize_emissions(hmm, used_feats, label_map)
+        emis_df.to_csv("reports/emissions_table.csv", index=False)
+        print("[OK] Emissions table -> reports/emissions_table.csv")
+    except Exception:
+        pass
+
     df.to_csv("reports/oura_states.csv", index=False)
     print("[OK] States CSV -> reports/oura_states.csv")
-
 

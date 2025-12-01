@@ -38,6 +38,44 @@ def vec_mag(ax, ay, az):
     az = np.asarray(az, dtype=float)
     return np.sqrt(ax*ax + ay*ay + az*az)
 
+# augmenting our data set with outputs from the hmm in order to stabilize prediction
+def augment_from_hmm(df_feat, used_feats, hmm_like, n_factor=1.0, not_healthy_boost=1.5,
+                     cov_shrink=0.7, clip=4.0, rng=0):
+    import numpy as np, pandas as pd
+    rs = np.random.RandomState(rng)
+    means = hmm_like.means_
+    covars = hmm_like.covars_
+    K, d = means.shape
+    # pick “not_healthy” by severity (+rhr +temp −rmssd −seff)
+    weight_map = {"rhr_z": +1.0, "rmssd_z": -1.0, "temp_z": +1.0, "seff_z": -1.0}
+    w = np.array([weight_map.get(f, 0.0) for f in used_feats], float)
+    sev = means.dot(w)
+    idx_not = int(np.argmax(sev))
+    # allocation
+    n_real = len(df_feat)
+    n_syn = int(round(n_factor * n_real))
+    if K == 2:
+        p_not = not_healthy_boost / (1.0 + not_healthy_boost)
+        alloc = {idx_not: int(round(n_syn * p_not)), 1 - idx_not: n_syn - int(round(n_syn * p_not))}
+    else:
+        per = n_syn // K
+        alloc = {k: per for k in range(K)}
+        alloc[0] += n_syn - per * K
+    # draw
+    syn_parts = []
+    for k, n_k in alloc.items():
+        if n_k <= 0: continue
+        var = covars[k] * cov_shrink
+        z = rs.normal(size=(n_k, d))
+        x = means[k] + z * np.sqrt(var)
+        x = np.clip(x, -clip, clip)
+        syn_parts.append(pd.DataFrame(x, columns=used_feats))
+    syn = pd.concat(syn_parts, ignore_index=True) if syn_parts else pd.DataFrame(columns=used_feats)
+    syn["synthetic"] = True
+    real = df_feat.copy()
+    real["synthetic"] = False
+    return pd.concat([real, syn], ignore_index=True)
+
 
 # ---- NEW: normalize columns from various DREAMT/E4 dumps ----
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -141,73 +179,7 @@ def nightly_aggregate(ep):
     if np.isnan(night[["rhr_night","temp_night"]].values).all():
         return None
     return night
-"""
-builds feature per person instead of per night
-not good as it does not make efficient use of our data points
 
-def build_dreamt_features():
-    files = sorted(DATA_RAW.glob("S*_whole_df.csv"))
-    if not files:
-        files = sorted(DATA_RAW.glob("*.csv"))
-
-    print(f"[INFO] Looking in {DATA_RAW}; found {len(files)} CSV(s)")
-    records = []
-    bad = []
-
-    for fpath in files:
-        try:
-            subj_id = fpath.stem.split("_")[0]  # "S002"
-            raw = load_subject_csv(fpath)
-            # quick column report
-            present = ", ".join([c for c in ["HR","IBI_ms","TEMP","EDA","ACC_x","ACC_y","ACC_z"] if c in raw.columns])
-            print(f"  - {fpath.name}: cols[{present}] rows={len(raw)}")
-            ep  = resample_epochize(raw, epoch_sec=30)
-            night = nightly_aggregate(ep)
-            if night is None:
-                bad.append((fpath.name, "no usable epoch features"))
-                continue
-            night["subject"] = subj_id
-            night["date"] = pd.to_datetime("2020-01-01")  # placeholder
-            records.append(night)
-        except Exception as e:
-            bad.append((fpath.name, str(e)))
-
-    if not records:
-        print("[ERROR] No usable nights were extracted.")
-        if bad:
-            print("Details:")
-            for name, msg in bad[:20]:
-                print(f"   * {name}: {msg}")
-        raise RuntimeError(f"No DREAMT features extracted from {DATA_RAW}. Check columns and file format.")
-
-    df = pd.concat(records, ignore_index=True)
-    df = df.sort_values(["subject","date"]).reset_index(drop=True)
-
-    # Cohort (global) z-scores so single-night subjects aren't dropped
-    def zscore(x):
-        m = np.nanmean(x); s = np.nanstd(x, ddof=0)
-        return (x - m) / (s if s > 1e-8 else 1.0)
-
-    df["rhr_z"]   = zscore(df["rhr_night"])
-    df["rmssd_z"] = zscore(df["rmssd_night"]) * (-1.0)
-    df["temp_z"]  = zscore(df["temp_night"])
-    df["seff_z"]  = zscore(df["sleep_eff_proxy"]) * (-1.0)
-
-    # Keep rows with at least two valid features (looser filter)
-    keep_mask = (
-        df[["rhr_z","rmssd_z","temp_z","seff_z"]].isna().sum(axis=1) <= 2
-    )
-    df = df[keep_mask].reset_index(drop=True)
-
-    out_path = FEAT_DIR / "dreamt_nightly.parquet"
-    df.to_parquet(out_path, index=False)
-    print(f"[OK] DREAMT nightly features -> {out_path} (rows={len(df)})")
-
-    if len(df) == 0:
-        raise RuntimeError("Feature table is empty after z-scoring. Check which signals are present and relax filters.")
-
-    return df
-"""
 def build_dreamt_features():
     files = sorted(DATA_RAW.glob("S*_whole_df.csv")) or sorted(DATA_RAW.glob("*.csv"))
     print(f"[INFO] Looking in {DATA_RAW}; found {len(files)} CSV(s)")
@@ -309,58 +281,6 @@ def build_dreamt_features():
         raise RuntimeError("Feature table empty after z-scoring.")
     return df
 
-"""
-fits on old feature set
-simplifying the model 
-
-def fit_hmm_on_features(df, K=4, seed=0):
-    # Candidate features in priority order
-    feat_candidates = ["rhr_z", "rmssd_z", "temp_z", "seff_z"]
-
-    # Keep features with at least 60% non-NaN coverage
-    coverage = df[feat_candidates].notna().mean()
-    used_feats = [c for c in feat_candidates if coverage.get(c, 0.0) >= 0.60]
-    if len(used_feats) < 2:
-        raise RuntimeError(f"Not enough usable features. Coverage={coverage.to_dict()}")
-
-    X_raw = df[used_feats].astype(np.float64).values
-    imputer = SimpleImputer(strategy="median")
-    X = imputer.fit_transform(X_raw)  # no NaNs from here on
-
-    # KMeans init
-    km = KMeans(n_clusters=K, random_state=seed, n_init="auto").fit(X)
-    hmm = GaussianHMM(n_components=K, covariance_type="full", n_iter=300, random_state=seed)
-    hmm.means_ = km.cluster_centers_
-
-    trans = np.full((K, K), 1.0 / K)
-    np.fill_diagonal(trans, 0.70)
-    for i in range(K):
-        trans[i] /= trans[i].sum()
-    hmm.transmat_ = trans
-    hmm.fit(X)
-
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    dump(hmm, MODEL_DIR / "model.pkl")
-    dump(imputer, MODEL_DIR / "imputer.pkl")
-    # Save feature list so validation/app use the same columns
-    with open(MODEL_DIR / "features.json", "w") as f:
-        json.dump({"features": used_feats}, f)
-
-    # Label mapping by severity (sum of means)
-    means = hmm.means_
-    severity = means.sum(axis=1)
-    idx = np.argsort(severity)  # low -> high
-    labels = np.empty(hmm.n_components, dtype=object)
-    if hmm.n_components == 3:
-        labels[idx[0]] = "healthy"; labels[idx[1]] = "recovery"; labels[idx[2]] = "symptomatic"
-    else:
-        labels[idx[0]] = "healthy"; labels[idx[1]] = "prodrome"; labels[idx[2]] = "recovery"; labels[idx[3]] = "symptomatic"
-    with open(MODEL_DIR / "labels.json", "w") as f:
-        json.dump({str(i): labels[i] for i in range(hmm.n_components)}, f)
-
-    print(f"[OK] HMM saved. Using features: {used_feats}")
-    return hmm, labels
-"""
 
 def fit_hmm_on_features(df, K=3, seed=0):
     # Prefer physiological trio; fall back to seff if coverage is high
@@ -374,48 +294,46 @@ def fit_hmm_on_features(df, K=3, seed=0):
     if len(used_feats) < 2:
         raise RuntimeError(f"Not enough usable features. Coverage={coverage.to_dict()}")
 
-    X_raw = df[used_feats].astype(np.float64).values
+   
+    used_feats = ["rhr_z","rmssd_z","temp_z"]  # keep seff_z only if coverage is good
+
+    X_raw = df[used_feats].astype("float64").values
     imputer = SimpleImputer(strategy="median")
     X = imputer.fit_transform(X_raw)
 
-    # sequence lengths per subject (nights per subject)
-    lengths = df.groupby("subject")["date"].count().tolist()
+    # Independent nights: one-step sequences
+    lengths = [1] * len(X)
 
-    # KMeans init + sticky-ish transitions
-    km = KMeans(n_clusters=K, random_state=seed, n_init="auto").fit(X)
-    trans = np.full((K, K), 1.0 / K)
-    np.fill_diagonal(trans, 0.88)  # a bit sticky
-    for i in range(K): trans[i] /= trans[i].sum()
+    # Init means with KMeans
+    km = KMeans(n_clusters=K, random_state=0, n_init="auto").fit(X)
+    means0 = km.cluster_centers_
+
+    # Fixed, sticky transitions (healthy stays healthy)
+    T = np.array([[0.96, 0.04],
+                [0.10, 0.90]])
 
     hmm = GaussianHMM(
-        n_components=K,
-        covariance_type="diag",  # tighter clusters
+        n_components=2,
+        covariance_type="diag",
         n_iter=400,
-        random_state=seed,
-        init_params="sc"         # keep our means_ and transmat_
+        random_state=0,
+        init_params="sc",   # do NOT include 't' or 'm' so they aren’t overwritten
+        params="smc"
     )
-    hmm.means_ = km.cluster_centers_
-    hmm.transmat_ = trans
+    hmm.means_    = means0
+    hmm.transmat_ = T
+    hmm.min_covar = 1e-3   # small regularization
+    hmm.startprob_ = np.array([0.90,0.10], float)
 
     hmm.fit(X, lengths=lengths)
 
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    dump(hmm, MODEL_DIR / "model.pkl")
-    dump(imputer, MODEL_DIR / "imputer.pkl")
-    with open(MODEL_DIR / "features.json", "w") as f:
-        json.dump({"features": used_feats}, f)
-
-    # Data-driven state labels (severity = +rhr +temp -rmssd)
-    w = np.array([+1.0, -1.0, +1.0, 0.0])[:len(used_feats)]
-    sev = hmm.means_.dot(w)
-    order = np.argsort(sev)  # low -> high
+    # Label mapping: +rhr +temp −rmssd → “not_healthy”
+    w = np.array([+1.0, -1.0, +1.0])[:len(used_feats)]
+    sev = hmm.means_.dot(w)   # higher = worse
+    order = np.argsort(sev)
     labels = np.empty(K, dtype=object)
-    if K == 3:
-        labels[order[0]]="healthy"; labels[order[1]]="recovery"; labels[order[2]]="symptomatic"
-    else:
-        labels[order[0]]="healthy"; labels[order[1]]="prodrome"; labels[order[2]]="recovery"; labels[order[3]]="symptomatic"
-    with open(MODEL_DIR / "labels.json", "w") as f:
-        json.dump({str(i): labels[i] for i in range(K)}, f)
+    labels[order[0]] = "healthy"
+    labels[order[1]] = "not_healthy"
 
     print(f"[OK] HMM saved. Using features: {used_feats}")
     return hmm, labels
@@ -423,5 +341,5 @@ def fit_hmm_on_features(df, K=3, seed=0):
 
 if __name__ == "__main__":
     df = build_dreamt_features()
-    fit_hmm_on_features(df, K=3, seed=0)
+    fit_hmm_on_features(df, K=2, seed=0)
 
