@@ -1,0 +1,68 @@
+{
+  "n_subjects_train": 80,
+  "n_subjects_val": 20,
+  "n_nights_train": 80,
+  "n_nights_val": 20,
+  "used_features": [
+    "rhr_z",
+    "rmssd_z",
+    "temp_z"
+  ],
+  "state_labels": {
+    "0": "healthy",
+    "1": "not_healthy"
+  },
+  "loglike_train_total": -364.3662348713972,
+  "loglike_val_total": -92.0077655975915,
+  "loglike_train_avg_per_sample": -4.554577935892465,
+  "loglike_val_avg_per_sample": -4.600388279879575,
+  "posterior_entropy_train": 0.16884046858620078,
+  "posterior_entropy_val": 0.30644899099859596,
+  "state_proportions_train": {
+    "healthy": 0.3044868029167277,
+    "not_healthy": 0.6955131970832698
+  },
+  "state_proportions_val": {
+    "healthy": 0.16963949400016126,
+    "not_healthy": 0.8303605059998382
+  },
+  "silhouette_train": 0.24166351092530905,
+  "state_means": {
+    "healthy": {
+      "rhr_z": 0.1004232440709915,
+      "rmssd_z": -0.8026101114644569,
+      "temp_z": -1.8062831461455302
+    },
+    "not_healthy": {
+      "rhr_z": 0.060772585524422565,
+      "rmssd_z": 0.06726733578357222,
+      "temp_z": 0.05198109680740684
+    }
+  },
+  "state_covars": {
+    "healthy": {
+      "rhr_z": 1.788348977168931,
+      "rmssd_z": 0.0,
+      "temp_z": 0.0
+    },
+    "not_healthy": {
+      "rhr_z": 0.8228104832947063,
+      "rmssd_z": 0.0,
+      "temp_z": 0.0
+    }
+  },
+  "transmat": [
+    [
+      0.96,
+      0.04
+    ],
+    [
+      0.1,
+      0.9
+    ]
+  ],
+  "startprob": [
+    0.2483787891154532,
+    0.7516212108845469
+  ]
+}

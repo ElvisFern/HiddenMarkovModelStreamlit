@@ -119,12 +119,21 @@ def build_oura_nightly(oura_root="data_raw/oura"):
         else:
             read["readiness"] = np.nan
 
-        # Some readiness exports include temperature deviation; keep as fallback
-        if "temperature_deviation" in read.columns and "temp_dev" not in locals():
-            read = read.rename(columns={"temperature_deviation": "temp_dev"})
-        read = read[["date", "readiness"] + (["temp_dev"] if "temp_dev" in read.columns else [])]
+       # Pull out body_temperature contributor if present
+        if "contributors" in read.columns:
+            r_contrib = read["contributors"].apply(_parse_contributors)
+            read["body_temperature"] = r_contrib.apply(
+                lambda d: d.get("body_temperature", np.nan)
+            )
+
+        # Keep just the columns we care about
+        cols = ["date", "readiness"]
+        if "body_temperature" in read.columns:
+            cols.append("body_temperature")
+        read = read[cols]
     else:
         read = pd.DataFrame(columns=["date", "readiness"])
+
     print("[DEBUG] readiness rows:", len(read), "cols:", list(read.columns)[:6])
     print(read.head(3))
 
@@ -171,17 +180,26 @@ def build_oura_nightly(oura_root="data_raw/oura"):
             h_date = "day" if "day" in hrt.columns else ("date" if "date" in hrt.columns else "summary_date")
             hrt["date"] = pd.to_datetime(hrt[h_date]).dt.tz_localize(None).dt.date
 
-        # prefer explicit resting_heart_rate; otherwise pick a sensible alt
+        # Prefer explicit resting_heart_rate if present or can be inferred from a similarly named column
         if "resting_heart_rate" not in hrt.columns:
             cand = [c for c in hrt.columns if "resting" in c.lower() and "heart" in c.lower()]
             if cand:
                 hrt = hrt.rename(columns={cand[0]: "resting_heart_rate"})
-            else:
-                hrt["resting_heart_rate"] = np.nan
 
-        hrt = hrt[["date", "resting_heart_rate"]].rename(columns={"resting_heart_rate": "rhr"})
+        # If we now have resting_heart_rate, use it as rhr directly;
+        # otherwise we’ll fall back to bpm later once we’ve seen all columns.
+        if "resting_heart_rate" in hrt.columns:
+            hrt["rhr"] = hrt["resting_heart_rate"]
+
+        # Keep date + whatever we might need (rhr, bpm, source)
+        keep_cols = ["date"]
+        for c in ["rhr", "bpm", "source"]:
+            if c in hrt.columns:
+                keep_cols.append(c)
+        hrt = hrt[keep_cols]
     else:
         hrt = pd.DataFrame(columns=["date", "rhr"])
+
 
     # ---- HRV (rmssd) if present anywhere (often missing in new exports)
     # Try dailyresilience.csv as a proxy; else leave NaN and imputer will handle
@@ -205,41 +223,7 @@ def build_oura_nightly(oura_root="data_raw/oura"):
     else:
         resil = pd.DataFrame(columns=["date", "rmssd"])
 
-    # Sleep
-    sleep = sleep.rename(columns={date_col: "date"})
-    sleep["date"] = _to_day_datetime(sleep["date"])
-
-    # Readiness
-    ...
-    if "timestamp" in read.columns:
-        read["date"] = _to_day_datetime(read["timestamp"])
-    else:
-        date_col = "day" if "day" in read.columns else ("date" if "date" in read.columns else "summary_date")
-        read["date"] = _to_day_datetime(read[date_col])
-
-    # Temperature
-    ...
-    if "timestamp" in tdf.columns:
-        tdf["date"] = _to_day_datetime(tdf["timestamp"])
-    else:
-        t_date = "day" if "day" in tdf.columns else ("date" if "date" in tdf.columns else "summary_date")
-        tdf["date"] = _to_day_datetime(tdf[t_date])
-
-    # Heart rate
-    ...
-    if "timestamp" in hrt.columns:
-        hrt["date"] = _to_day_datetime(hrt["timestamp"])
-    else:
-        h_date = "day" if "day" in hrt.columns else ("date" if "date" in hrt.columns else "summary_date")
-        hrt["date"] = _to_day_datetime(hrt[h_date])
-
-    # Resilience / HRV
-    ...
-    if "timestamp" in resil.columns:
-        resil["date"] = _to_day_datetime(resil["timestamp"])
-    else:
-        rz_date = "day" if "day" in resil.columns else ("date" if "date" in resil.columns else "summary_date")
-        resil["date"] = _to_day_datetime(resil[rz_date])
+   
 
     def _norm_inplace_date(_df):
         if "date" in _df.columns:
@@ -257,12 +241,16 @@ def build_oura_nightly(oura_root="data_raw/oura"):
     sleep = (sleep.groupby("date", as_index=False)
                 .agg({"sleep_efficiency":"mean", "sleep_score":"mean"}))
 
+    # Aggregate readiness (and any extras we kept, like temp_dev / body_temperature)
+    agg = {"readiness": "mean"}
+    if "body_temperature" in read.columns:
+        agg["body_temperature"] = "mean"
+
     read = (read.groupby("date", as_index=False)
-                .agg({"readiness":"mean"}))
+                .agg(agg))
 
     tdf = (tdf.groupby("date", as_index=False)
             .agg({"temp_dev":"mean"}))
-
     # Heart rate: prefer true resting_heart_rate; else fallback
     if "rhr" not in hrt.columns and "bpm" in hrt.columns:
         hrt["rhr"] = pd.to_numeric(hrt["bpm"], errors="coerce")

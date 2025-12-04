@@ -10,6 +10,7 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from joblib import dump
+from sklearn.metrics import silhouette_score
 
 # --- PATHS ---
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -39,6 +40,7 @@ def vec_mag(ax, ay, az):
     return np.sqrt(ax*ax + ay*ay + az*az)
 
 # augmenting our data set with outputs from the hmm in order to stabilize prediction
+# not in use decided not to overfit the model
 def augment_from_hmm(df_feat, used_feats, hmm_like, n_factor=1.0, not_healthy_boost=1.5,
                      cov_shrink=0.7, clip=4.0, rng=0):
     import numpy as np, pandas as pd
@@ -281,21 +283,36 @@ def build_dreamt_features():
         raise RuntimeError("Feature table empty after z-scoring.")
     return df
 
+def train_val_split_by_subject(df, val_frac=0.2, seed=0):
+    subjects = df["subject"].dropna().unique()
+    rng = np.random.RandomState(seed)
+    rng.shuffle(subjects)
+
+    n_val = max(1, int(round(len(subjects) * val_frac)))
+    val_subj = list(subjects[:n_val])
+    train_subj = [s for s in subjects if s not in val_subj]
+
+    df_train = df[df["subject"].isin(train_subj)].reset_index(drop=True)
+    df_val   = df[df["subject"].isin(val_subj)].reset_index(drop=True)
+
+    print(f"[SPLIT] train_subj={len(train_subj)} val_subj={len(val_subj)}")
+    return df_train, df_val, train_subj, val_subj
 
 def fit_hmm_on_features(df, K=3, seed=0):
     # Prefer physiological trio; fall back to seff if coverage is high
     feat_candidates = ["rhr_z", "rmssd_z", "temp_z", "seff_z"]
     coverage = df[feat_candidates].notna().mean()
-    used_feats = [c for c in ["rhr_z","rmssd_z","temp_z"] if coverage.get(c,0) >= 0.40]
+    used_feats = [c for c in ["rhr_z", "rmssd_z", "temp_z"] if coverage.get(c, 0) >= 0.40]
     if len(used_feats) < 2:
         # add seff_z if needed
-        if coverage.get("seff_z",0) >= 0.60:
+        if coverage.get("seff_z", 0) >= 0.60:
             used_feats += ["seff_z"]
     if len(used_feats) < 2:
         raise RuntimeError(f"Not enough usable features. Coverage={coverage.to_dict()}")
 
-   
-    used_feats = ["rhr_z","rmssd_z","temp_z"]  # keep seff_z only if coverage is good
+    # For now, keep trio unless seff_z was explicitly added above
+    if "seff_z" not in used_feats:
+        used_feats = ["rhr_z", "rmssd_z", "temp_z"]
 
     X_raw = df[used_feats].astype("float64").values
     imputer = SimpleImputer(strategy="median")
@@ -305,25 +322,25 @@ def fit_hmm_on_features(df, K=3, seed=0):
     lengths = [1] * len(X)
 
     # Init means with KMeans
-    km = KMeans(n_clusters=K, random_state=0, n_init="auto").fit(X)
+    km = KMeans(n_clusters=K, random_state=seed, n_init="auto").fit(X)
     means0 = km.cluster_centers_
 
     # Fixed, sticky transitions (healthy stays healthy)
     T = np.array([[0.96, 0.04],
-                [0.10, 0.90]])
+                  [0.10, 0.90]])
 
     hmm = GaussianHMM(
         n_components=2,
         covariance_type="diag",
         n_iter=400,
-        random_state=0,
+        random_state=seed,
         init_params="sc",   # do NOT include 't' or 'm' so they aren’t overwritten
         params="smc"
     )
-    hmm.means_    = means0
+    hmm.means_ = means0
     hmm.transmat_ = T
     hmm.min_covar = 1e-3   # small regularization
-    hmm.startprob_ = np.array([0.90,0.10], float)
+    hmm.startprob_ = np.array([0.90, 0.10], float)
 
     hmm.fit(X, lengths=lengths)
 
@@ -335,11 +352,45 @@ def fit_hmm_on_features(df, K=3, seed=0):
     labels[order[0]] = "healthy"
     labels[order[1]] = "not_healthy"
 
-    print(f"[OK] HMM saved. Using features: {used_feats}")
-    return hmm, labels
+    print(f"[OK] HMM fitted. Using features: {used_feats}")
+    return hmm, labels, used_feats, imputer
+
 
 
 if __name__ == "__main__":
-    df = build_dreamt_features()
-    fit_hmm_on_features(df, K=2, seed=0)
+    df_all = build_dreamt_features()
+
+    df_train, df_val, train_subj, val_subj = train_val_split_by_subject(df_all, val_frac=0.20, seed=0)
+
+    hmm, labels, used_feats, imputer = fit_hmm_on_features(df_train, K=2, seed=0)
+
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1) save model
+    dump(hmm, MODEL_DIR / "dreamt_hmm.joblib")
+    dump(imputer, MODEL_DIR / "dreamt_imputer.joblib")
+
+    # 2) save split info
+    with open(MODEL_DIR / "train_val_split.json", "w") as f:
+        json.dump(
+            {
+                "train_subjects": train_subj,
+                "val_subjects": val_subj,
+                "val_frac": 0.20,
+                "seed": 0,
+            },
+            f,
+            indent=2,
+        )
+
+    # 3) save HMM metadata
+    meta = {
+        "used_feats": used_feats,
+        "labels": {int(i): str(l) for i, l in enumerate(labels)},
+    }
+    with open(MODEL_DIR / "hmm_meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print("[OK] model + split + meta saved.")
+
 

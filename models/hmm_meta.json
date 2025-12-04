@@ -1,0 +1,11 @@
+{
+  "used_feats": [
+    "rhr_z",
+    "rmssd_z",
+    "temp_z"
+  ],
+  "labels": {
+    "0": "healthy",
+    "1": "not_healthy"
+  }
+}
