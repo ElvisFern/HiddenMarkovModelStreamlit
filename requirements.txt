@@ -8,3 +8,4 @@ hmmlearn
 scikit-learn
 streamlit
 joblib
+st_autorefresh

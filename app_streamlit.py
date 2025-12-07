@@ -322,7 +322,7 @@ def fetch_recent_temp_deviation(token: str, days: int = 7, return_raw: bool = Fa
     end = dt.date.today()
     start = end - dt.timedelta(days=days)
 
-    url = f"{OURA_BASE}/daily_body_temperature"
+    url = f"{OURA_BASE}/daily_readiness"
     headers = {"Authorization": f"Bearer {token}"}
     params = {
         "start_date": start.isoformat(),
@@ -386,12 +386,11 @@ def _safe_contrib_get(x, key):
     return None
 
 
-def build_daily_from_api(token: str, days: int = 7, return_raw=False):
+def build_daily_from_api(token: str, days: int = 7, return_raw: bool = False):
     """
     Build a daily feature table for the last `days` days using:
       - daily_sleep        -> sleep_efficiency, sleep_score
       - daily_readiness    -> readiness, resting HR, temperature deviation
-    This mirrors the columns used in the CSV-based pipeline.
     """
     end_date = dt.date.today()
     start_date = end_date - dt.timedelta(days=days)
@@ -403,6 +402,36 @@ def build_daily_from_api(token: str, days: int = 7, return_raw=False):
 
     sleep_payload = _oura_get(token, "daily_sleep", params)
     read_payload  = _oura_get(token, "daily_readiness", params)
+    # : pull HR timeseries and collapse to daily min/median
+    start_iso = f"{start_date.isoformat()}T00:00:00Z"
+    end_iso   = f"{(end_date + dt.timedelta(days=1)).isoformat()}T00:00:00Z"
+    hr_payload = _oura_get(token, "heartrate", {
+        "start_datetime": start_iso,
+        "end_datetime":   end_iso,
+    })
+
+    hr = pd.DataFrame(hr_payload.get("data", []))
+
+    if not hr.empty and "timestamp" in hr.columns:
+        # parse as UTC, then drop tz so it matches sleep/readiness
+        hr["timestamp"] = pd.to_datetime(hr["timestamp"], utc=True)
+
+        # normalize to midnight *and* remove timezone
+        hr["date"] = (
+            hr["timestamp"]
+            .dt.tz_convert("UTC")      # keep it in UTC
+            .dt.tz_localize(None)      # drop tz info → datetime64[ns]
+            .dt.normalize()            # midnight of that day
+        )
+
+        hr_daily = (
+            hr.groupby("date")["bpm"]
+            .median()                   # or median / mean, your choice
+            .rename("rhr")
+            .reset_index()
+        )
+    else:
+        hr_daily = pd.DataFrame(columns=["date", "rhr"])
 
     # ---------- daily_sleep ----------
     sleep = pd.DataFrame(sleep_payload.get("data", []))
@@ -415,7 +444,7 @@ def build_daily_from_api(token: str, days: int = 7, return_raw=False):
         else:
             sleep["date"] = pd.NaT
 
-        # sleep_efficiency: direct column or from contributors.efficiency
+        # sleep efficiency (0–1)
         if "sleep_efficiency" not in sleep.columns:
             if "contributors" in sleep.columns:
                 sleep["sleep_efficiency"] = sleep["contributors"].apply(
@@ -424,6 +453,7 @@ def build_daily_from_api(token: str, days: int = 7, return_raw=False):
             else:
                 sleep["sleep_efficiency"] = np.nan
 
+        # sleep score
         if "sleep_score" not in sleep.columns:
             if "score" in sleep.columns:
                 sleep["sleep_score"] = sleep["score"]
@@ -450,14 +480,40 @@ def build_daily_from_api(token: str, days: int = 7, return_raw=False):
             else:
                 read["readiness"] = np.nan
 
+        # resting heart rate
+        if "resting_heart_rate" in read.columns:
+            read["rhr"] = read["resting_heart_rate"]
+        else:
+            cand = [c for c in read.columns
+                    if "resting" in c.lower() and "heart" in c.lower()]
+            read["rhr"] = read[cand[0]] if cand else np.nan
+
+        # temperature deviation
+        if "temperature_deviation" in read.columns:
+            read["temp_dev"] = read["temperature_deviation"]
+        elif "temperature_delta" in read.columns:
+            read["temp_dev"] = read["temperature_delta"]
+        elif "temp_deviation" in read.columns:
+            read["temp_dev"] = read["temp_deviation"]
+        else:
+            read["temp_dev"] = np.nan
+
+        read_df = read[["date", "readiness", "rhr", "temp_dev"]]
+
     # ---------- merge + sort ----------
     df = (
         sleep_df.merge(read_df, on="date", how="outer", validate="one_to_one")
-        .sort_values("date")
-        .reset_index(drop=True)
+                .merge(hr_daily, on="date", how="left")
+                .sort_values("date")
+                .reset_index(drop=True)
     )
+    # After merging in hr_daily, resolve duplicate rhr columns
+    if "rhr_x" in df.columns and "rhr_y" in df.columns:
+        df["rhr"] = df["rhr_y"].fillna(df["rhr_x"])
+        df = df.drop(columns=["rhr_x", "rhr_y"])
 
-    # normalize sleep_efficiency if it's 0-100 instead of 0-1
+
+    # normalize sleep_efficiency if it's 0–100 instead of 0–1
     if "sleep_efficiency" in df.columns:
         if df["sleep_efficiency"].notna().any() and df["sleep_efficiency"].max() > 1.5:
             df["sleep_efficiency"] = df["sleep_efficiency"] / 100.0
@@ -467,11 +523,12 @@ def build_daily_from_api(token: str, days: int = 7, return_raw=False):
     return df
 
 
+
 # ------------------------- UI --------------------------------------
 st.title("Oura HMM Illness Detector")
 
-tab_batch, tab_live, tab_24h, tab_train = st.tabs(
-    ["Batch CSV (nightly)", "Live HR / Temp", "Last 24h (API → HMM)", "Last week (API → HMM)"]
+tab_batch, tab_live, tab_24h = st.tabs(
+    ["Batch CSV (nightly)", "Live HR / Temp", "Last 24h (API → HMM)" ]
 )
 
 
@@ -628,63 +685,31 @@ with tab_24h:
     )
 
     if token_24:
-        df_api = build_daily_from_api(token_24, days=2)
+    # pull a wider window, e.g. last 7 days
+        df_api, raw = build_daily_from_api(token_24, days=7, return_raw=True)
 
         if df_api.empty:
             st.warning(
-                "No daily Oura data found for the last 2 days. "
-                "Make sure the ring has synced and Oura has processed your sleep."
+                "No daily Oura data found for the requested range.\n\n"
+                "Check that your ring has synced and Oura has processed your recent sleep."
             )
+            with st.expander("Show raw Oura API response"):
+                st.json(raw)
         else:
-            st.write("Daily features (last 2 days):")
+            # Optionally show which date is actually the most recent
+            last_date = df_api["date"].max().date()
+            st.info(f"Last processed Oura daily data is for {last_date}.")
+
+            st.write("Daily features:")
             st.dataframe(df_api.tail())
 
             df_hmm, post, label_map, used_feats = apply_model(df_api)
             st.write({"features_used": used_feats})
             st.bar_chart(df_hmm["state"].value_counts())
 
-            from validate_oura import plot_timeline
-            out_img = Path("reports/figures/oura_timeline_api_24h.png")
-            plot_timeline(df_hmm, out_img)
-            st.image(str(out_img))
-
-with tab_train:
-    st.subheader("Use last 7 days of Oura API data")
-
-    token = st.text_input(
-        "Oura API access token (Bearer)",
-        type="password",
-        help="Paste your personal access token here.",
-        key="week_token",
-    )
-
-    if token:
-        days = st.slider("How many days back?", 2, 30, 7, step=1)
-
-        try:
-            daily_df, raw = build_daily_from_api(token, days=days, return_raw=True)
-
-            if daily_df.empty:
-                st.warning("No daily data returned for that window.")
-            else:
-                st.markdown("**Daily features (most recent first):**")
-                st.dataframe(daily_df.sort_values("date", ascending=False))
-
-                # If you want, you can now feed this into your HMM:
-                # df_hmm, post, label_map, used_feats = apply_model(daily_df.copy())
-                # st.write({'features_used': used_feats})
-                # st.bar_chart(df_hmm['state'].value_counts())
-
-            with st.expander("Show raw daily_sleep API response"):
-                st.json(raw["sleep"])
-            with st.expander("Show raw daily_readiness API response"):
-                st.json(raw["readiness"])
-
-        except Exception as e:
-            st.error(f"Error while fetching or building daily features: {e}")
-    else:
-        st.info("Enter your Oura API token to load daily features.")
-
-
+            # use the local, safe plot_timeline defined above
+            fig = plot_timeline(df_hmm)
+            if fig is not None:
+                st.pyplot(fig)
 
 
