@@ -27,7 +27,7 @@ Project/
 │     ├─ heart_rate.csv
 │     └─ ...
 │
-├─ data_feat/                # Auto-generated intermediate feature files
+├─ data_feat/                # Created by pipeline.py intermediate feature files
 ├─ models/                   # Trained model artifacts (model.pkl, labels.json)
 └─ reports/                  # Validation outputs (e.g., oura_states.csv)
 ```
